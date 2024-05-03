@@ -3,7 +3,8 @@ import torch
 import torch.nn as nn
 import tinycudann as tcnn
 
-class NGP(nn.Module):
+
+class VBRNeRF(nn.Module):
     def __init__(self,
                  R: int = 4, # num resolutions
                  N: int = 1024, # num buckets
@@ -14,7 +15,6 @@ class NGP(nn.Module):
                  resolution_feature_scaler: float = 1.0,
                  output_activation = "sigmoid",
                  ) -> None:
-        # resolution_feature_scaler scales hash feature magnitudes by R^resolution_feature_scaler where R is the resolution
         super().__init__()
         self.resolutions = list(np.round(np.logspace(np.log2(min_resolution), np.log2(max_resolution), R, base=2)).astype(int))
         self.N = N
@@ -27,18 +27,10 @@ class NGP(nn.Module):
             "n_neurons": 32,
             "n_hidden_layers": 2,
         }
-        # if use_hash:
-        self.hash_features = nn.Parameter((torch.rand(R, N, F).cuda() - .5) * 2e-4) # U(-1e-4, 1e-4)
-        self.mlp = tcnn.Network(R*F, 3, config)
-        # else:
-        #     self.hash_features = None
-        #     self.pre_mlp = MLP(3, F, intermediate_channels=32, n_layers=1)
-        #     self.mlp = MLP(R*F, 3, intermediate_channels=64, n_layers=2)
         self.resolution_feature_scaler = resolution_feature_scaler
         self.hashmap = None
-        # self.permutations = (torch.tensor(np.random.permutation(374761393)),
-        #                     torch.tensor(np.random.permutation(25745623)),
-        #                     torch.tensor(np.random.permutation(62731)))
+        self.hash_features = nn.Parameter((torch.rand(R, N, F).cuda() - .5) * 2e-4) # U(-1e-4, 1e-4)
+        self.mlp = tcnn.Network(R*F, 3, config)
     
     def bilerp_hash(self, coords: torch.FloatTensor):
         # coords in [0,1] with shape (*, 2)
@@ -100,6 +92,7 @@ class NGP(nn.Module):
                 out = self.mlp(feats).float()
                 self.float()
                 return out
+                # feats = feats.float()
         else:
             feats = self.bilerp_hash(x)
         return self.mlp(feats)
