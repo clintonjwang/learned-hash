@@ -1,11 +1,12 @@
 from PIL import Image
 import argparse
 import numpy as np
-import torch
 import pandas as pd
 import os, glob
+import torch
+nn = torch.nn
 
-import utils
+import utils, metrics
 import train
 
 def main():
@@ -15,14 +16,14 @@ def main():
     exp_group_name = args.name
 
     image_paths = sorted(glob.glob('./data/kodak/*.png'))
-    results_path = f'results/results.csv'
-    if not os.path.exists(results_path):
+    results_csv_path = f'results/results.csv'
+    if not os.path.exists(results_csv_path):
         results = pd.DataFrame(columns=['path', 'format', 'psnr', 'ssim', 'size'])
     else:
-        results = pd.read_csv(results_path)
+        results = pd.read_csv(results_csv_path)
         
     # fixed hyperparameters
-    n_iters = 2000
+    n_iters = 1000
     n_refinement_iters = 1000
     iteration_budget = n_iters + n_refinement_iters
     R = 8
@@ -38,7 +39,7 @@ def main():
     # JPG compression
     for quality in (50,60,70,80):
         jpg, jpg_size = utils.to_jpg(Image.open(img_path), quality=quality)
-        jpg_psnr, jpg_ssim = utils.psnr(jpg, img), utils.ssim(jpg, img)
+        jpg_psnr, jpg_ssim = metrics.psnr(jpg, img), metrics.ssim(jpg, img)
         results.loc[len(results.index)] = [img_path, 'JPG', jpg_psnr, jpg_ssim, jpg_size]
 
     # NGP and compressed NGP
@@ -55,19 +56,10 @@ def main():
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-        render = model.render(compress=True, to_numpy=True)
-        ngp_size = model.get_size()
-        ngp_psnr, ngp_ssim = utils.psnr(render, img), utils.ssim(render, img)
-        Image.fromarray((render * 255).astype(np.uint8)).save(f'renders/{run_name}_ngp_{os.path.basename(img_path)}')
-        results.loc[len(results.index)] = [img_path, 'iNGP', ngp_psnr, ngp_ssim, ngp_size]
-
-        # compress and refine hash table
-        F = model.hash_features.shape[-1]
-        buckets_per_feat=8
-        quantized_feats, indices = model.quantize_table(buckets_per_feat)
-        model.update_hash_feats(quantized_feats, indices)
-
-        optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, betas=(.9,.99), eps=1e-15)
+        torch.save({
+            'model_state_dict': model.state_dict(),
+            'losses': losses,
+        }, 'tmp.ckpt')
         for _ in range(n_refinement_iters):
             loss = ((model.render() - torch_img)**2).mean()
             losses.append(loss.item())
@@ -75,12 +67,35 @@ def main():
             loss.backward()
             optimizer.step()
         render = model.render(compress=True, to_numpy=True)
-        cngp_size = model.get_size()
-        cngp_psnr, cngp_ssim = utils.psnr(render, img), utils.ssim(render, img)
-        Image.fromarray((render * 255).astype(np.uint8)).save(f'renders/{run_name}_cngp_{os.path.basename(img_path)}')
-        results.loc[len(results.index)] = [img_path, 'cNGP', cngp_psnr, cngp_ssim, cngp_size]
+        ngp_size = model.get_size()
+        ngp_psnr, ngp_ssim = metrics.psnr(render, img), metrics.ssim(render, img)
+        Image.fromarray((render * 255).astype(np.uint8)).save(f'renders/{run_name}_ngp_{os.path.basename(img_path)}')
+        results.loc[len(results.index)] = [img_path, 'iNGP', ngp_psnr, ngp_ssim, ngp_size]
 
-        results.to_csv(f'results/{exp_group_name}.csv')
+        # compress and refine hash table
+        for buckets_per_feat in (8, 10):
+            model.hashmap = None
+            model.hash_features = nn.Parameter(torch.zeros_like(ckpt['model_state_dict']['hash_features']))
+            ckpt = torch.load('tmp.ckpt')
+            model.load_state_dict(ckpt['model_state_dict'])
+            losses = ckpt['losses']
+            quantized_feats, indices = model.quantize_table(buckets_per_feat)
+            model.update_hash_feats(quantized_feats, indices)
+
+            optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, betas=(.9,.99), eps=1e-15)
+            for _ in range(n_refinement_iters):
+                loss = ((model.render() - torch_img)**2).mean()
+                losses.append(loss.item())
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+            render = model.render(compress=True, to_numpy=True)
+            cngp_size = model.get_size()
+            cngp_psnr, cngp_ssim = metrics.psnr(render, img), metrics.ssim(render, img)
+            results.loc[len(results.index)] = [img_path, 'cNGP', cngp_psnr, cngp_ssim, cngp_size]
+        Image.fromarray((render * 255).astype(np.uint8)).save(f'renders/{run_name}_cngp_{os.path.basename(img_path)}')
+
+        results.to_csv(results_csv_path)
 
 if __name__ == '__main__':
     main()
