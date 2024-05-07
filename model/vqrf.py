@@ -4,7 +4,7 @@ import torch.nn as nn
 import tinycudann as tcnn
 
 
-class VQNeRF(nn.Module):
+class VQRF(nn.Module):
     def __init__(self,
                  N: int = 1024, # num buckets (codebook size)
                  F: int = 8, # num features
@@ -61,18 +61,6 @@ class VQNeRF(nn.Module):
             feats = self.bilerp_hash(x)
         return self.mlp(feats)
     
-    def grid_coords(self):
-        H,W = self.shape
-        return torch.stack(torch.meshgrid(torch.linspace(0,1,H), torch.linspace(0,1,W), indexing='ij'), -1).reshape(-1,2).to(device=self.device)
-
-    def render(self, compress: bool = False, to_numpy: bool = False):
-        rgb = self.forward(self.grid_coords(), compress=compress)
-        rgb = rgb.reshape(*self.shape,3)
-        if to_numpy:
-            return rgb.clamp(0,1).float().cpu().detach().numpy()
-        else:
-            return rgb
-
     def update_hash_feats(self, new_feats, hashmap):
         self.hash_features = nn.Parameter(new_feats)
         if self.hashmap is None:

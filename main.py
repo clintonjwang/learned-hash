@@ -14,6 +14,11 @@ def main():
     parser.add_argument('-n', '--name', type=str, default='default')
     args = parser.parse_args()
     exp_group_name = args.name
+    _jpg = True
+    _ngp = True
+    _cngp = True
+    _vqnerf = True
+    _vbrnerf = True
 
     image_paths = sorted(glob.glob('./data/kodak/*.png'))
     results_csv_path = f'results/results.csv'
@@ -37,10 +42,28 @@ def main():
     img = np.array(Image.open(img_path)) / 255.
 
     # JPG compression
-    for quality in (50,60,70,80):
-        jpg, jpg_size = utils.to_jpg(Image.open(img_path), quality=quality)
-        jpg_psnr, jpg_ssim = metrics.psnr(jpg, img), metrics.ssim(jpg, img)
-        results.loc[len(results.index)] = [img_path, 'JPG', jpg_psnr, jpg_ssim, jpg_size]
+    if _jpg:
+        for quality in (50,60,70,80):
+            jpg, model_size = utils.to_jpg(Image.open(img_path), quality=quality)
+            psnr, ssim = metrics.psnr(jpg, img), metrics.ssim(jpg, img)
+            results.loc[len(results.index)] = [img_path, 'JPG', psnr, ssim, model_size]
+
+    if _vqnerf:
+        for budget in (50,60,70,80):
+            model, optimizer = train.init_model(img)
+            render = model.render(compress=True, to_numpy=True)
+            model_size = model.get_size()
+            psnr, ssim = metrics.psnr(render, img), metrics.ssim(render, img)
+            results.loc[len(results.index)] = [img_path, 'VQNeRF', psnr, ssim, model_size]
+
+    if _vbrnerf:
+        for budget in (50,60,70,80):
+            model, optimizer = train.init_model(img)
+            render = model.render(compress=True, to_numpy=True)
+            model_size = model.get_size()
+            psnr, ssim = metrics.psnr(render, img), metrics.ssim(render, img)
+            results.loc[len(results.index)] = [img_path, 'VBNeRF', psnr, ssim, model_size]
+
 
     # NGP and compressed NGP
     for N in (2**8, 2**10, 2**12):
@@ -60,29 +83,7 @@ def main():
             'model_state_dict': model.state_dict(),
             'losses': losses,
         }, 'tmp.ckpt')
-        for _ in range(n_refinement_iters):
-            loss = ((model.render() - torch_img)**2).mean()
-            losses.append(loss.item())
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-        render = model.render(compress=True, to_numpy=True)
-        ngp_size = model.get_size()
-        ngp_psnr, ngp_ssim = metrics.psnr(render, img), metrics.ssim(render, img)
-        Image.fromarray((render * 255).astype(np.uint8)).save(f'renders/{run_name}_ngp_{os.path.basename(img_path)}')
-        results.loc[len(results.index)] = [img_path, 'iNGP', ngp_psnr, ngp_ssim, ngp_size]
-
-        # compress and refine hash table
-        for buckets_per_feat in (8, 10):
-            model.hashmap = None
-            model.hash_features = nn.Parameter(torch.zeros_like(ckpt['model_state_dict']['hash_features']))
-            ckpt = torch.load('tmp.ckpt')
-            model.load_state_dict(ckpt['model_state_dict'])
-            losses = ckpt['losses']
-            quantized_feats, indices = model.quantize_table(buckets_per_feat)
-            model.update_hash_feats(quantized_feats, indices)
-
-            optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, betas=(.9,.99), eps=1e-15)
+        if _ngp:
             for _ in range(n_refinement_iters):
                 loss = ((model.render() - torch_img)**2).mean()
                 losses.append(loss.item())
@@ -90,10 +91,34 @@ def main():
                 loss.backward()
                 optimizer.step()
             render = model.render(compress=True, to_numpy=True)
-            cngp_size = model.get_size()
-            cngp_psnr, cngp_ssim = metrics.psnr(render, img), metrics.ssim(render, img)
-            results.loc[len(results.index)] = [img_path, 'cNGP', cngp_psnr, cngp_ssim, cngp_size]
-        Image.fromarray((render * 255).astype(np.uint8)).save(f'renders/{run_name}_cngp_{os.path.basename(img_path)}')
+            model_size = model.get_size()
+            psnr, ssim = metrics.psnr(render, img), metrics.ssim(render, img)
+            Image.fromarray((render * 255).astype(np.uint8)).save(f'renders/{run_name}_ngp_{os.path.basename(img_path)}')
+            results.loc[len(results.index)] = [img_path, 'iNGP', psnr, ssim, model_size]
+
+        if _cngp:
+            # compress and refine hash table
+            for buckets_per_feat in (8, 10):
+                model.hashmap = None
+                model.hash_features = nn.Parameter(torch.zeros_like(ckpt['model_state_dict']['hash_features']))
+                ckpt = torch.load('tmp.ckpt')
+                model.load_state_dict(ckpt['model_state_dict'])
+                losses = ckpt['losses']
+                quantized_feats, indices = model.quantize_table(buckets_per_feat)
+                model.update_hash_feats(quantized_feats, indices)
+
+                optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, betas=(.9,.99), eps=1e-15)
+                for _ in range(n_refinement_iters):
+                    loss = ((model.render() - torch_img)**2).mean()
+                    losses.append(loss.item())
+                    optimizer.zero_grad()
+                    loss.backward()
+                    optimizer.step()
+                render = model.render(compress=True, to_numpy=True)
+                model_size = model.get_size()
+                psnr, ssim = metrics.psnr(render, img), metrics.ssim(render, img)
+                results.loc[len(results.index)] = [img_path, 'cNGP', psnr, ssim, model_size]
+            Image.fromarray((render * 255).astype(np.uint8)).save(f'renders/{run_name}_cngp_{os.path.basename(img_path)}')
 
         results.to_csv(results_csv_path)
 

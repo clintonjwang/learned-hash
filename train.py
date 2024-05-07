@@ -1,12 +1,21 @@
 import numpy as np
 import torch
 
-from model import ngp
+from model import ngp, compact_ngp, vbrnerf, vqrf
 
 def init_model(img: np.ndarray, **kwargs):
     kwargs = {**dict(R=5, N=2**10, F=2, lr=1e-2), **kwargs}
     lr = kwargs.pop('lr')
-    model = ngp.NGP(shape=img.shape[:2], **kwargs).cuda()
+    model_type = kwargs.pop('model_type', 'ngp')
+    if model_type == 'ngp':
+        model = ngp.NGP(shape=img.shape[:2], **kwargs).cuda()
+    elif model_type == 'cngp':
+        model = compact_ngp.CompactNGP(shape=img.shape[:2], **kwargs).cuda()
+    elif model_type == 'vqnerf':
+        model = vqrf.VQNeRF(shape=img.shape[:2], **kwargs).cuda()
+    elif model_type == 'vbrnerf':
+        model = vbrnerf.VBRNeRF(shape=img.shape[:2], **kwargs).cuda()
+        
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, betas=(.9,.99), eps=1e-15)
     return model, optimizer
 
