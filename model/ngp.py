@@ -3,7 +3,42 @@ import torch
 import torch.nn as nn
 import tinycudann as tcnn
 
-class NGP(nn.Module):
+
+class INR(nn.Module):
+    def bilerp_hash(self, coords: torch.FloatTensor):
+        raise NotImplementedError
+    
+    def forward(self, x: torch.FloatTensor, compress=False) -> torch.Tensor:
+        # x has shape (*, d)
+        if compress:
+            with torch.no_grad():
+                self.half()
+                x = x.half()
+                feats = self.bilerp_hash(x)
+                out = self.mlp(feats).float()
+                self.float()
+                return out
+        else:
+            feats = self.bilerp_hash(x)
+            return self.mlp(feats)
+    
+    def grid_coords(self):
+        H,W = self.shape
+        return torch.stack(torch.meshgrid(torch.linspace(0,1,H), torch.linspace(0,1,W), indexing='ij'), -1).reshape(-1,2).cuda()
+
+    def render(self, compress: bool = False, to_numpy: bool = False):
+        rgb = self.forward(self.grid_coords(), compress=compress)
+        rgb = rgb.reshape(*self.shape,3)
+        if to_numpy:
+            return rgb.clamp(0,1).float().cpu().detach().numpy()
+        else:
+            return rgb
+
+    def get_mlp_size(self):
+        return sum(p.numel() for p in self.mlp.parameters()) * 2 / 1024
+
+
+class NGP(INR):
     def __init__(self,
                  R: int = 4, # num resolutions
                  N: int = 1024, # num buckets
@@ -84,18 +119,6 @@ class NGP(nn.Module):
             feats = self.bilerp_hash(x)
             return self.mlp(feats)
     
-    def grid_coords(self):
-        H,W = self.shape
-        return torch.stack(torch.meshgrid(torch.linspace(0,1,H), torch.linspace(0,1,W), indexing='ij'), -1).reshape(-1,2).cuda()
-
-    def render(self, compress: bool = False, to_numpy: bool = False):
-        rgb = self.forward(self.grid_coords(), compress=compress)
-        rgb = rgb.reshape(*self.shape,3)
-        if to_numpy:
-            return rgb.clamp(0,1).float().cpu().detach().numpy()
-        else:
-            return rgb
-
     def render_hash(self, resolution):
         H,W = self.shape
         x = torch.stack(torch.meshgrid(torch.arange(H//resolution), torch.arange(W//resolution), indexing='ij'), -1).reshape(-1,2).cuda()
@@ -106,9 +129,6 @@ class NGP(nn.Module):
         
     def get_size(self):
         return self.get_mlp_size() + self.get_hash_size()
-
-    def get_mlp_size(self):
-        return sum(p.numel() for p in self.mlp.parameters()) * 2 / 1024
 
     def get_hash_size(self):
         return self.hash_features.numel() * 2 / 1024

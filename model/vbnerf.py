@@ -3,9 +3,9 @@ import torch
 import torch.nn as nn
 import tinycudann as tcnn
 
-from ngp import NGP
+from .ngp import NGP
 
-class VBRNeRF(NGP):
+class VBNeRF(NGP):
     def __init__(self,
                  R: int = 4, # num resolutions
                  N: int = 1024, # num buckets

@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import tinycudann as tcnn
 
-from ngp import NGP
+from .ngp import NGP
 
 
 class CompactNGP(NGP):

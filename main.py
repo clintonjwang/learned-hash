@@ -1,126 +1,167 @@
-from PIL import Image
+import sys, os
+import imageio
 import argparse
+
+import random
 import numpy as np
-import pandas as pd
-import os, glob
 import torch
 nn = torch.nn
+import mmcv
 
-import utils, metrics
 import train
+import render
+import train_3d
+from data import load_data
+
+
+def load_everything(args, cfg):
+    '''Load images / poses / camera settings / data split.
+    '''
+    data_dict = load_data.load_data(cfg.data)
+
+    # remove useless field
+    kept_keys = {
+            'hwf', 'HW', 'Ks', 'near', 'far', 'near_clip',
+            'i_train', 'i_val', 'i_test', 'irregular_shape',
+            'poses', 'render_poses', 'images'}
+    for k in list(data_dict.keys()):
+        if k not in kept_keys:
+            data_dict.pop(k)
+
+    # construct data tensor
+    if data_dict['irregular_shape']:
+        data_dict['images'] = [torch.FloatTensor(im, device='cpu') for im in data_dict['images']]
+    else:
+        data_dict['images'] = torch.FloatTensor(data_dict['images'], device='cpu')
+    data_dict['poses'] = torch.Tensor(data_dict['poses'])
+    return data_dict
+
+def seed_everything(args):
+    '''Seed everything for better reproducibility.
+    (some pytorch operation is non-deterministic like the backprop of grid_samples)
+    '''
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    random.seed(args.seed)
+
 
 def main():
     parser = argparse.ArgumentParser(description='Image Loader')
     parser.add_argument('-n', '--name', type=str, default='default')
+    parser.add_argument('-c', '--config', type=str, default='configs/llff/fern.py')
+    parser.add_argument("--seed", type=int, default=777,
+                        help='Random seed')
+    parser.add_argument('--run2d', action='store_true')
+    parser.add_argument('--jpg', action='store_true')
+    parser.add_argument('--ngp', action='store_true')
+    parser.add_argument('--ours', action='store_true')
+    parser.add_argument('--vqrf', action='store_true')
+    parser.add_argument('--vbnerf', action='store_true')
+    
+    # testing options
+    parser.add_argument("--render_only", action='store_true',
+                        help='do not optimize, reload weights and render out render_poses path')
+    parser.add_argument("--render_test", action='store_true')
+    parser.add_argument("--render_train", action='store_true')
+    parser.add_argument("--render_video", action='store_true')
+    parser.add_argument("--render_video_flipy", action='store_true')
+    parser.add_argument("--render_video_rot90", default=0, type=int)
+    parser.add_argument("--render_video_factor", type=float, default=0,
+                        help='downsampling factor to speed up rendering, set 4 or 8 for fast preview')
+    parser.add_argument("--dump_images", action='store_true')
+    parser.add_argument("--eval_ssim", action='store_true')
+    parser.add_argument("--eval_lpips_alex", action='store_true')
+    parser.add_argument("--eval_lpips_vgg", action='store_true')
+
     args = parser.parse_args()
-    exp_group_name = args.name
-    _jpg = True
-    _ngp = True
-    _cngp = True
-    _vqnerf = True
-    _vbrnerf = True
-
-    image_paths = sorted(glob.glob('./data/kodak/*.png'))
-    results_csv_path = f'results/results.csv'
-    if not os.path.exists(results_csv_path):
-        results = pd.DataFrame(columns=['path', 'format', 'psnr', 'ssim', 'size'])
+    cfg = mmcv.Config.fromfile(args.config)
+    if args.run2d:
+        train.run_2d(args)
+        return
     else:
-        results = pd.read_csv(results_csv_path)
-        
-    # fixed hyperparameters
-    n_iters = 1000
-    n_refinement_iters = 1000
-    iteration_budget = n_iters + n_refinement_iters
-    R = 8
-    F = 6
-    fixed_hyperparameters = dict(R=R, F=F, iteration_budget=iteration_budget)
-    np.save(f'results/{exp_group_name}', fixed_hyperparameters)
+        seed_everything(args)
+        data_dict = load_everything(args, cfg)
 
-    # for ix, img_path in enumerate(image_paths):
-    # print(f'fitting image {ix+1}/{len(image_paths)}...')
-    img_path = image_paths[17]
-    img = np.array(Image.open(img_path)) / 255.
+    # train
+    if not args.render_only:
+        train_3d.train(args, cfg, data_dict)
 
-    # JPG compression
-    if _jpg:
-        for quality in (50,60,70,80):
-            jpg, model_size = utils.to_jpg(Image.open(img_path), quality=quality)
-            psnr, ssim = metrics.psnr(jpg, img), metrics.ssim(jpg, img)
-            results.loc[len(results.index)] = [img_path, 'JPG', psnr, ssim, model_size]
+    # load model for rendring
+    if args.render_test or args.render_train or args.render_video:
+        if args.ft_path:
+            ckpt_path = args.ft_path
+        else:
+            ckpt_path = os.path.join(cfg.basedir, cfg.expname, 'fine_last.tar')
+        ckpt_name = ckpt_path.split('/')[-1][:-4]
+        model = train.load_model(model.DirectVoxGO, ckpt_path).cuda()
+        stepsize = cfg.fine_model_and_render.stepsize
+        render_viewpoints_kwargs = {
+            'model': model,
+            'ndc': cfg.data.ndc,
+            'render_kwargs': {
+                'near': data_dict['near'],
+                'far': data_dict['far'],
+                'bg': 1 if cfg.data.white_bkgd else 0,
+                'stepsize': stepsize,
+                'inverse_y': cfg.data.inverse_y,
+                'flip_x': cfg.data.flip_x,
+                'flip_y': cfg.data.flip_y,
+                'render_depth': True,
+            },
+        }
 
-    if _vqnerf:
-        for budget in (50,60,70,80):
-            model, optimizer = train.init_model(img)
-            render = model.render(compress=True, to_numpy=True)
-            model_size = model.get_size()
-            psnr, ssim = metrics.psnr(render, img), metrics.ssim(render, img)
-            results.loc[len(results.index)] = [img_path, 'VQNeRF', psnr, ssim, model_size]
+    # render trainset and eval
+    if args.render_train:
+        testsavedir = os.path.join(cfg.basedir, cfg.expname, f'render_train_{ckpt_name}')
+        os.makedirs(testsavedir, exist_ok=True)
+        print('All results are dumped into', testsavedir)
+        rgbs, depths, bgmaps = render.render_viewpoints(
+                render_poses=data_dict['poses'][data_dict['i_train']],
+                HW=data_dict['HW'][data_dict['i_train']],
+                Ks=data_dict['Ks'][data_dict['i_train']],
+                gt_imgs=[data_dict['images'][i].cpu().numpy() for i in data_dict['i_train']],
+                savedir=testsavedir, dump_images=args.dump_images,
+                eval_ssim=args.eval_ssim, eval_lpips_alex=args.eval_lpips_alex, eval_lpips_vgg=args.eval_lpips_vgg,
+                **render_viewpoints_kwargs)
+        imageio.mimwrite(os.path.join(testsavedir, 'video.rgb.mp4'), utils.to8b(rgbs), fps=30, quality=8)
+        imageio.mimwrite(os.path.join(testsavedir, 'video.depth.mp4'), utils.to8b(1 - depths / np.max(depths)), fps=30, quality=8)
 
-    if _vbrnerf:
-        for budget in (50,60,70,80):
-            model, optimizer = train.init_model(img)
-            render = model.render(compress=True, to_numpy=True)
-            model_size = model.get_size()
-            psnr, ssim = metrics.psnr(render, img), metrics.ssim(render, img)
-            results.loc[len(results.index)] = [img_path, 'VBNeRF', psnr, ssim, model_size]
+    # render testset and eval
+    if args.render_test:
+        testsavedir = os.path.join(cfg.basedir, cfg.expname, f'render_test_{ckpt_name}')
+        os.makedirs(testsavedir, exist_ok=True)
+        print('All results are dumped into', testsavedir)
+        rgbs, depths, bgmaps = render.render_viewpoints(
+                render_poses=data_dict['poses'][data_dict['i_test']],
+                HW=data_dict['HW'][data_dict['i_test']],
+                Ks=data_dict['Ks'][data_dict['i_test']],
+                gt_imgs=[data_dict['images'][i].cpu().numpy() for i in data_dict['i_test']],
+                savedir=testsavedir, dump_images=args.dump_images,
+                eval_ssim=args.eval_ssim, eval_lpips_alex=args.eval_lpips_alex, eval_lpips_vgg=args.eval_lpips_vgg,
+                **render_viewpoints_kwargs)
+        imageio.mimwrite(os.path.join(testsavedir, 'video.rgb.mp4'), utils.to8b(rgbs), fps=30, quality=8)
+        imageio.mimwrite(os.path.join(testsavedir, 'video.depth.mp4'), utils.to8b(1 - depths / np.max(depths)), fps=30, quality=8)
 
-
-    # NGP and compressed NGP
-    for N in (2**8, 2**10, 2**12):
-        run_name = f'{exp_group_name}_{N=}'
-
-        # fit image with NGP
-        losses = []
-        model, optimizer = train.init_model(img, R=R, N=N, F=F, min_resolution=32, max_resolution=512, resolution_feature_scaler=0.1)
-        torch_img = torch.tensor(img).cuda()
-        for _ in range(n_iters):
-            loss = ((model.render() - torch_img)**2).mean()
-            losses.append(loss.item())
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-        torch.save({
-            'model_state_dict': model.state_dict(),
-            'losses': losses,
-        }, 'tmp.ckpt')
-        if _ngp:
-            for _ in range(n_refinement_iters):
-                loss = ((model.render() - torch_img)**2).mean()
-                losses.append(loss.item())
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-            render = model.render(compress=True, to_numpy=True)
-            model_size = model.get_size()
-            psnr, ssim = metrics.psnr(render, img), metrics.ssim(render, img)
-            Image.fromarray((render * 255).astype(np.uint8)).save(f'renders/{run_name}_ngp_{os.path.basename(img_path)}')
-            results.loc[len(results.index)] = [img_path, 'iNGP', psnr, ssim, model_size]
-
-        if _cngp:
-            # compress and refine hash table
-            for buckets_per_feat in (8, 10):
-                model.hashmap = None
-                model.hash_features = nn.Parameter(torch.zeros_like(ckpt['model_state_dict']['hash_features']))
-                ckpt = torch.load('tmp.ckpt')
-                model.load_state_dict(ckpt['model_state_dict'])
-                losses = ckpt['losses']
-                quantized_feats, indices = model.quantize_table(buckets_per_feat)
-                model.update_hash_feats(quantized_feats, indices)
-
-                optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, betas=(.9,.99), eps=1e-15)
-                for _ in range(n_refinement_iters):
-                    loss = ((model.render() - torch_img)**2).mean()
-                    losses.append(loss.item())
-                    optimizer.zero_grad()
-                    loss.backward()
-                    optimizer.step()
-                render = model.render(compress=True, to_numpy=True)
-                model_size = model.get_size()
-                psnr, ssim = metrics.psnr(render, img), metrics.ssim(render, img)
-                results.loc[len(results.index)] = [img_path, 'cNGP', psnr, ssim, model_size]
-            Image.fromarray((render * 255).astype(np.uint8)).save(f'renders/{run_name}_cngp_{os.path.basename(img_path)}')
-
-        results.to_csv(results_csv_path)
+    # render video
+    if args.render_video:
+        testsavedir = os.path.join(cfg.basedir, cfg.expname, f'render_video_{ckpt_name}')
+        os.makedirs(testsavedir, exist_ok=True)
+        print('All results are dumped into', testsavedir)
+        rgbs, depths, bgmaps = render.render_viewpoints(
+                render_poses=data_dict['render_poses'],
+                HW=data_dict['HW'][data_dict['i_test']][[0]].repeat(len(data_dict['render_poses']), 0),
+                Ks=data_dict['Ks'][data_dict['i_test']][[0]].repeat(len(data_dict['render_poses']), 0),
+                render_factor=args.render_video_factor,
+                render_video_flipy=args.render_video_flipy,
+                render_video_rot90=args.render_video_rot90,
+                savedir=testsavedir, dump_images=args.dump_images,
+                **render_viewpoints_kwargs)
+        imageio.mimwrite(os.path.join(testsavedir, 'video.rgb.mp4'), utils.to8b(rgbs), fps=30, quality=8)
+        import matplotlib.pyplot as plt
+        depths_vis = depths * (1-bgmaps) + bgmaps
+        dmin, dmax = np.percentile(depths_vis[bgmaps < 0.1], q=[5, 95])
+        depth_vis = plt.get_cmap('rainbow')(1 - np.clip((depths_vis - dmin) / (dmax - dmin), 0, 1)).squeeze()[..., :3]
+        imageio.mimwrite(os.path.join(testsavedir, 'video.depth.mp4'), utils.to8b(depth_vis), fps=30, quality=8)
 
 if __name__ == '__main__':
     main()
