@@ -7,6 +7,8 @@ from math import exp
 from PIL import Image
 import os
 
+mse2psnr = lambda x : -10. * torch.log10(x)
+
 def psnr(x,y):
     return -np.log10(((x - y)**2).mean()) * 10
 

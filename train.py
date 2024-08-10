@@ -1,13 +1,13 @@
 import numpy as np
-import torch
 from PIL import Image
 import numpy as np
 import pandas as pd
 import os, glob, time
+import torch
+nn = torch.nn
 
 import utils, metrics
-
-from model import ngp, compact_ngp, vbnerf, vqrf
+from model import cluster_ngp, ngp, vbnerf, vqrf, vqngp
 
 
 
@@ -15,6 +15,7 @@ def run_2d(args):
     exp_group_name = args.name
     _jpg = args.jpg
     _ngp = args.ngp
+    _vqngp = args.vqngp
     _cngp = args.ours
     _vqrf = args.vqrf
     _vbnerf = args.vbnerf
@@ -24,7 +25,7 @@ def run_2d(args):
     if not os.path.exists(results_csv_path):
         results = pd.DataFrame(columns=['path', 'format', 'psnr', 'ssim', 'size'])
     else:
-        results = pd.read_csv(results_csv_path)
+        results = pd.read_csv(results_csv_path, index_col=0)
         
     # fixed hyperparameters
     n_iters = 1000
@@ -114,28 +115,50 @@ def run_2d(args):
                 Image.fromarray((render * 255).astype(np.uint8)).save(f'renders/{run_name}_ngp_{os.path.basename(img_path)}')
                 results.loc[len(results.index)] = [img_path, 'iNGP', psnr, ssim, model_size]
 
+            if _vqngp:
+                # compress and refine hash table
+                ckpt = torch.load('tmp.ckpt')
+                model, optimizer = init_model(img, model_type='VQNGP', R=R, N=N, F=F, min_resolution=32, max_resolution=512, resolution_feature_scaler=0.1)
+                model.load_state_dict(ckpt['model_state_dict'], strict=False)
+                model.hash_features = nn.Parameter(torch.zeros_like(ckpt['model_state_dict']['hash_features']))
+                losses = ckpt['losses']
+                quantized_feats, indices = model.quantize_table(N)
+                model.update_hash_feats(quantized_feats, indices)
+
+                optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, betas=(.9,.99), eps=1e-15)
+                for _ in range(n_refinement_iters):
+                    loss = ((model.render() - torch_img)**2).mean()
+                    losses.append(loss.item())
+                    optimizer.zero_grad()
+                    loss.backward()
+                    optimizer.step()
+                render = model.render(compress=True, to_numpy=True)
+                model_size = model.get_size()
+                psnr, ssim = metrics.psnr(render, img), metrics.ssim(render, img)
+                results.loc[len(results.index)] = [img_path, 'cNGP', psnr, ssim, model_size]
+                Image.fromarray((render * 255).astype(np.uint8)).save(f'renders/{run_name}_cngp_{os.path.basename(img_path)}')
+
             if _cngp:
                 # compress and refine hash table
-                for buckets_per_feat in (8, 10):
-                    model.hashmap = None
-                    model.hash_features = nn.Parameter(torch.zeros_like(ckpt['model_state_dict']['hash_features']))
-                    ckpt = torch.load('tmp.ckpt')
-                    model.load_state_dict(ckpt['model_state_dict'])
-                    losses = ckpt['losses']
-                    quantized_feats, indices = model.quantize_table(buckets_per_feat)
-                    model.update_hash_feats(quantized_feats, indices)
+                ckpt = torch.load('tmp.ckpt')
+                model, optimizer = init_model(img, model_type='CNGP', R=R, N=N, F=F, min_resolution=32, max_resolution=512, resolution_feature_scaler=0.1)
+                model.load_state_dict(ckpt['model_state_dict'], strict=False)
+                model.hash_features = nn.Parameter(torch.zeros_like(ckpt['model_state_dict']['hash_features']))
+                losses = ckpt['losses']
+                quantized_feats, indices = model.quantize_table(N)
+                model.update_hash_feats(quantized_feats, indices)
 
-                    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, betas=(.9,.99), eps=1e-15)
-                    for _ in range(n_refinement_iters):
-                        loss = ((model.render() - torch_img)**2).mean()
-                        losses.append(loss.item())
-                        optimizer.zero_grad()
-                        loss.backward()
-                        optimizer.step()
-                    render = model.render(compress=True, to_numpy=True)
-                    model_size = model.get_size()
-                    psnr, ssim = metrics.psnr(render, img), metrics.ssim(render, img)
-                    results.loc[len(results.index)] = [img_path, 'cNGP', psnr, ssim, model_size]
+                optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, betas=(.9,.99), eps=1e-15)
+                for _ in range(n_refinement_iters):
+                    loss = ((model.render() - torch_img)**2).mean()
+                    losses.append(loss.item())
+                    optimizer.zero_grad()
+                    loss.backward()
+                    optimizer.step()
+                render = model.render(compress=True, to_numpy=True)
+                model_size = model.get_size()
+                psnr, ssim = metrics.psnr(render, img), metrics.ssim(render, img)
+                results.loc[len(results.index)] = [img_path, 'cNGP', psnr, ssim, model_size]
                 Image.fromarray((render * 255).astype(np.uint8)).save(f'renders/{run_name}_cngp_{os.path.basename(img_path)}')
 
     results.to_csv(results_csv_path)
@@ -157,7 +180,9 @@ def init_model(img: np.ndarray, **kwargs):
     if model_type == 'ngp':
         model = ngp.NGP(shape=img.shape[:2], **kwargs).cuda()
     elif model_type == 'cngp':
-        model = compact_ngp.CompactNGP(shape=img.shape[:2], **kwargs).cuda()
+        model = cluster_ngp.ClusterNGP(shape=img.shape[:2], **kwargs).cuda()
+    elif model_type == 'vqngp':
+        model = vqngp.VQNGP(shape=img.shape[:2], **kwargs).cuda()
     elif model_type == 'vqrf':
         model = vqrf.VQRF(shape=img.shape[:2], **kwargs).cuda()
     elif model_type == 'vbnerf':

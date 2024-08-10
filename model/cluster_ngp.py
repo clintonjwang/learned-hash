@@ -6,7 +6,7 @@ import tinycudann as tcnn
 from .ngp import NGP
 
 
-class CompactNGP(NGP):
+class ClusterNGP(NGP):
     def __init__(self,
                  R: int = 4, # num resolutions
                  N: int = 1024, # num buckets
@@ -116,23 +116,15 @@ class CompactNGP(NGP):
         quantized_feats = unique_values / (buckets_per_feat-1) * (xmax - xmin) + xmin
         return quantized_feats, indices.reshape(self.hash_features.shape[:-1])
 
-def quantize_table(hash_table, buckets_per_feat: int):
+def quantize_table(hash_table, N_clusters: int, N_iters=10):
     # hash_table has shape (*, N, F)
-    # the total buckets is <= buckets_per_feat ** F
     # returns:
-    #   (*, total_buckets, F) tensor of bucket centers
+    #   (N_clusters, F) tensor of bucket centers
     #   (*, N) tensor of bucket indices for the hash features
-    if buckets_per_feat <= 256:
-        dtype = torch.quint8
-    else:
-        dtype = torch.qint32
-    x = hash_table
-    xmin, xmax = x.min(), x.max()
-    x = (x - xmin)/(xmax - xmin)
     F = x.shape[-1]
-    quantized_tensor = torch.quantize_per_tensor(x.reshape(-1,F), scale=1/(buckets_per_feat-1), zero_point=0, dtype=dtype)
-    unique_values, indices = torch.unique(quantized_tensor.int_repr(), return_inverse=True, dim=-2)
-    # if unique_values.shape[-2] >= x.shape[-2] * .9:
-    #     raise ValueError(f'failed to compress buckets sufficiently (from {x.shape[-2:]} to {unique_values.shape[-2:]})')
-    quantized_feats = unique_values / (buckets_per_feat-1) * (xmax - xmin) + xmin
-    return quantized_feats, indices.reshape(hash_table.shape[:-1])
+    x = hash_table.reshape(-1, F)
+    cluster_centroids = hash_table[:N_clusters]
+    for _ in range(N_iters):
+        cluster_indices = torch.argmin(x - cluster_centroids, dim=0)
+        cluster_centroids = (x[cluster_indices]).mean(dim=0)
+    return cluster_centroids, cluster_indices
